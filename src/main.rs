@@ -1,50 +1,78 @@
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use core::time;
+use std::io::{BufRead, BufReader, BufWriter, ErrorKind, Read, Write};
 use std::thread;
 use std::{net::TcpListener, sync::mpsc};
 
-struct AppState {
-    client_connection: u32,
-}
+const MSG_SIZE: usize = 32;
 
-impl AppState {
-    fn increase_client(&self) -> u32 {
-        self.client_connection + 1
-    }
+fn sleep() {
+    thread::sleep(time::Duration::from_millis(100));
 }
 
 fn main() {
-    let app_state = AppState {
-        client_connection: 0,
-    };
+    let listeners = TcpListener::bind("127.0.0.1:8080").expect("Listener failed to bind");
+    listeners
+        .set_nonblocking(true)
+        .expect("failed initial nonblocking");
 
-    let listeners = TcpListener::bind("127.0.0.1:8080").unwrap();
+    let (sender, receiver) = mpsc::channel::<String>();
+    let mut clients = vec![];
 
     for stream in listeners.incoming() {
-        println!("Client connected: {:?}", stream);
-        app_state.increase_client();
-        let (tx, rx) = mpsc::channel::<String>();
-
         match stream {
             Ok(mut stream) => {
-                let stream_reader = stream.try_clone().unwrap();
-                thread::spawn(move || {
-                    let mut reader = BufReader::new(stream_reader);
-                    let mut buffer = String::new();
+                println!("Client connected: {:?}", stream);
+                let sender = sender.clone();
 
-                    while reader.read_line(&mut buffer).unwrap() > 0 {
-                        println!("{}", buffer.trim());
-                        tx.send(buffer.clone()).expect("Can not send to channel");
+                clients.push(stream.try_clone().unwrap());
+
+                thread::spawn(move || loop {
+                    let mut buffer = vec![0; MSG_SIZE];
+
+                    match stream.read_exact(&mut buffer) {
+                        Ok(_) => {
+                            let msg = buffer.into_iter().take_while(|&x| x != 0).collect();
+                            let msg = String::from_utf8(msg).expect("Cannot convert to string");
+                            println!("{}", msg);
+                            sender.send(msg).expect("Can not send to channel");
+                        }
+                        Err(ref err) if err.kind() == ErrorKind::WouldBlock => (),
+                        Err(_) => {
+                            println!(
+                                "Unexpected error closing connection with: {:?}",
+                                stream.try_clone().unwrap()
+                            );
+                            break;
+                        }
                     }
+                    sleep();
                 });
-
-                for mess in rx {
-                    let mut writer = BufWriter::new(&stream);
-                    writer.write_all(mess.as_bytes());
-                }
             }
+
+            Err(ref e) if e.kind() == ErrorKind::WouldBlock => (),
             Err(err) => {
                 eprintln!("Error accepting stream {}", err);
             }
         }
+
+        match receiver.try_recv() {
+            Ok(msg) => {
+                println!("{}", msg);
+                clients = clients
+                    .into_iter()
+                    .filter_map(|mut client| {
+                        let mut buff = msg.clone().into_bytes();
+
+                        buff.resize(MSG_SIZE, 0);
+                        client.write_all(&buff).map(|_| client).ok()
+                    })
+                    .collect::<Vec<_>>();
+            }
+            Err(mpsc::TryRecvError::Empty) => (),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                println!("Sender disconnected");
+            }
+        }
+        sleep();
     }
 }
